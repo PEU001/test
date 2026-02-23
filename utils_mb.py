@@ -1,3 +1,4 @@
+
 # utils_mb.py
 import os
 import re
@@ -14,20 +15,15 @@ API_ROOT = "https://musicbrainz.org/ws/2"
 LOG_FILE = "mb_rating_tag.log"
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".mp4", ".alac"}
 
-
-# ---------------------------------------------------------------------
-#                           LOG
-# ---------------------------------------------------------------------
+# ---------------- Log ----------------
 def write_log(status: str, file_rel: str, details: str, log_file: str = LOG_FILE):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    line = f"{ts} | {status.upper()} | {file_rel} | {details}\n"
-    with open(log_file, "a", encoding="utf-8") as f:
+    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    line = f"{ts} | {status.upper()} | {file_rel} | {details}
+"
+    with open(log_file, 'a', encoding='utf-8') as f:
         f.write(line)
 
-
-# ---------------------------------------------------------------------
-#                      HELPERS POUR LECTURE TAGS
-# ---------------------------------------------------------------------
+# --------------- Helpers ---------------
 def read_string(v):
     if v is None:
         return None
@@ -35,203 +31,220 @@ def read_string(v):
         return read_string(v[0]) if v else None
     if isinstance(v, bytes):
         try:
-            return v.decode("utf-8", "replace")
+            return v.decode('utf-8', 'replace')
         except Exception:
             return None
     return str(v)
 
-
-# ---------------------------------------------------------------------
-#                           EXTRACTION MBID
-# ---------------------------------------------------------------------
+# --------------- MBID / Identity ---------------
 def extract_mb_recording_id(audio, path: str):
     ext = os.path.splitext(path)[1].lower()
-
     # FLAC / Vorbis / Opus
     if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
         if audio.tags:
-            for key in ("MUSICBRAINZ_TRACKID", "MUSICBRAINZ_RECORDINGID", "MB_TRACKID"):
+            for key in ("MUSICBRAINZ_TRACKID","MUSICBRAINZ_RECORDINGID","MB_TRACKID"):
                 val = audio.tags.get(key)
                 if val:
                     s = read_string(val)
                     if s and re.match(r"^[0-9a-f-]{36}$", s, re.I):
                         return s
-
-    # MP3 / ID3
+    # MP3 ID3
     if ext == ".mp3":
         try:
             id3 = ID3(path)
-            for f in id3.getall("TXXX"):
-                desc = (f.desc or "").strip().lower()
-                if desc in {
-                    "musicbrainz track id",
-                    "musicbrainz_trackid",
-                    "musicbrainz recording id",
-                }:
-                    text = read_string(f.text)
+            for frame in id3.getall("TXXX"):
+                desc = (frame.desc or '').strip().lower()
+                if desc in {"musicbrainz track id","musicbrainz_trackid","musicbrainz recording id"}:
+                    text = read_string(frame.text)
                     if text and re.match(r"^[0-9a-f-]{36}$", text, re.I):
                         return text
         except ID3NoHeaderError:
             pass
-
-    # MP4 / M4A
-    if ext in {".m4a", ".mp4"} and isinstance(audio, MP4):
+    # MP4
+    if ext in {".m4a",".mp4"} and isinstance(audio, MP4):
         for k in (audio.tags or {}).keys():
-            lower = k.lower()
-            if lower.startswith("----:") and "musicbrainz" in lower and "track" in lower:
+            if k.lower().startswith("----:") and "musicbrainz" in k.lower() and "track" in k.lower():
                 val = audio.tags.get(k)
                 s = read_string(val)
                 if s and re.match(r"^[0-9a-f-]{36}$", s, re.I):
                     return s
-
     return None
 
 
-# ---------------------------------------------------------------------
-#                   EXTRACTION IDENTITÉ (artist/title/duration)
-# ---------------------------------------------------------------------
 def extract_basic_identity(audio, path: str):
     ext = os.path.splitext(path)[1].lower()
     artist = title = None
     duration_ms = None
-
-    if hasattr(audio, "info") and getattr(audio.info, "length", None):
+    if hasattr(audio, 'info') and getattr(audio.info, 'length', None):
         duration_ms = int(audio.info.length * 1000)
-
     if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
         tags = audio.tags or {}
-        artist = read_string(tags.get("ARTIST")) or read_string(tags.get("ALBUMARTIST"))
-        title = read_string(tags.get("TITLE"))
-
-    elif ext == ".mp3":
+        artist = read_string(tags.get('ARTIST')) or read_string(tags.get('ALBUMARTIST'))
+        title = read_string(tags.get('TITLE'))
+    elif ext == '.mp3':
         try:
             id3 = ID3(path)
-            artist = read_string(getattr(id3.get("TPE1"), "text", None))
-            title = read_string(getattr(id3.get("TIT2"), "text", None))
+            artist = read_string(getattr(id3.get('TPE1'),'text',None))
+            title = read_string(getattr(id3.get('TIT2'),'text',None))
         except ID3NoHeaderError:
             pass
-
-    elif ext in {".m4a", ".mp4"} and isinstance(audio, MP4):
+    elif ext in {'.m4a','.mp4'} and isinstance(audio, MP4):
         tags = audio.tags or {}
-        artist = read_string(tags.get("\xa9ART"))
-        title = read_string(tags.get("\xa9nam"))
-
+        artist = read_string(tags.get('©ART'))
+        title = read_string(tags.get('©nam'))
     return artist, title, duration_ms
 
-
-# ---------------------------------------------------------------------
-#                         MUSICBRAINZ : API
-# ---------------------------------------------------------------------
+# --------------- MusicBrainz API helpers ---------------
 def mb_get_recording_rating(mbid: str, ua: str):
     url = f"{API_ROOT}/recording/{mbid}"
     headers = {"User-Agent": ua}
-    params = {"inc": "ratings", "fmt": "json"}
+    params = {"inc":"ratings","fmt":"json"}
     r = requests.get(url, headers=headers, params=params, timeout=20)
     if r.status_code == 404:
         return None
     r.raise_for_status()
     data = r.json()
-    rating = data.get("rating", {})
-    return rating.get("value"), rating.get("votes-count")
+    rating = data.get('rating', {})
+    return rating.get('value'), rating.get('votes-count')
 
 
 def mb_search_recording(artist: str, title: str, duration_ms: int, ua: str):
     query = f'recording:"{title}" AND artist:"{artist}"'
     headers = {"User-Agent": ua}
-    params = {"query": query, "fmt": "json", "limit": 5}
+    params = {"query": query, "fmt":"json", "limit": 5}
     r = requests.get(f"{API_ROOT}/recording", headers=headers, params=params, timeout=25)
     if r.status_code == 404:
         return None
     r.raise_for_status()
     data = r.json()
-    recs = data.get("recordings") or []
+    recs = data.get('recordings') or []
     if not recs:
         return None
-
-    # 1) premier tri : score
-    recs.sort(key=lambda x: x.get("score", 0), reverse=True)
+    # choose best by score, then by closest duration
+    recs.sort(key=lambda x: x.get('score',0), reverse=True)
     best = recs[0]
-
-    # 2) durée la plus proche
     if duration_ms:
         def penalty(rec):
-            length = rec.get("length") or 10**9
+            length = rec.get('length') or 10**9
             return abs(length - duration_ms)
         recs.sort(key=penalty)
-        if abs((recs[0].get("length") or 10**9) - duration_ms) <= 2000:
+        if abs((recs[0].get('length') or 10**9) - duration_ms) <= 2000:
             best = recs[0]
+    return best.get('id')
 
-    return best.get("id")
+
+def mb_get_first_release_id_for_recording(rec_mbid: str, ua: str):
+    url = f"{API_ROOT}/recording/{rec_mbid}"
+    headers = {"User-Agent": ua}
+    params = {"inc":"releases","fmt":"json"}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    data = r.json()
+    rels = data.get('releases') or []
+    return rels[0]['id'] if rels else None
 
 
-# ---------------------------------------------------------------------
-#                       ÉCRITURE DU RATING
-# ---------------------------------------------------------------------
+def mb_get_release_group_id(release_mbid: str, ua: str):
+    url = f"{API_ROOT}/release/{release_mbid}"
+    headers = {"User-Agent": ua}
+    params = {"inc":"release-groups","fmt":"json"}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    data = r.json()
+    rg = data.get('release-group') or {}
+    return rg.get('id')
+
+
+def mb_get_release_group_rating(rgid: str, ua: str):
+    url = f"{API_ROOT}/release-group/{rgid}"
+    headers = {"User-Agent": ua}
+    params = {"inc":"ratings","fmt":"json"}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    data = r.json()
+    rating = data.get('rating', {})
+    return rating.get('value'), rating.get('votes-count')
+
+# --------------- Write rating (recording) ---------------
 def write_rating_generic(audio, path: str, rating: float, votes: int, write_popm: bool):
     ext = os.path.splitext(path)[1].lower()
     rating_str = f"{rating:.1f}"
     votes_str = str(votes) if votes is not None else None
 
-    # ----- FLAC / VORBIS -----
-    if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
-        audio["RATING"] = rating_str
-        audio["MUSICBRAINZ_RATING"] = rating_str
-        if votes_str:
-            audio["MUSICBRAINZ_RATING_VOTES"] = votes_str
-        audio.save()
-        return
+    if isinstance(audio,(FLAC,OggVorbis,OggOpus)):
+        audio['RATING'] = rating_str
+        audio['MUSICBRAINZ_RATING'] = rating_str
+        if votes_str: audio['MUSICBRAINZ_RATING_VOTES'] = votes_str
+        audio.save(); return
 
-    # ----- MP3 -----
-    if ext == ".mp3":
-        try:
-            id3 = ID3(path)
-        except ID3NoHeaderError:
-            id3 = ID3()
-
-        keep = []
-        for f in id3.getall("TXXX"):
-            d = (f.desc or "").lower()
-            if d not in {
-                "rating",
-                "musicbrainz_rating",
-                "musicbrainz_rating_votes",
-            }:
+    if ext == '.mp3':
+        try: id3 = ID3(path)
+        except ID3NoHeaderError: id3 = ID3()
+        keep=[]
+        for f in id3.getall('TXXX'):
+            d=(f.desc or '').lower()
+            if d not in {'rating','musicbrainz_rating','musicbrainz_rating_votes'}:
                 keep.append(f)
-        id3.setall("TXXX", keep)
-
-        id3.add(TXXX(encoding=3, desc="RATING", text=rating_str))
-        id3.add(TXXX(encoding=3, desc="MUSICBRAINZ_RATING", text=rating_str))
+        id3.setall('TXXX', keep)
+        id3.add(TXXX(encoding=3, desc='RATING', text=rating_str))
+        id3.add(TXXX(encoding=3, desc='MUSICBRAINZ_RATING', text=rating_str))
         if votes_str:
-            id3.add(TXXX(encoding=3, desc="MUSICBRAINZ_RATING_VOTES", text=votes_str))
-
+            id3.add(TXXX(encoding=3, desc='MUSICBRAINZ_RATING_VOTES', text=votes_str))
         if write_popm:
-            scaled = int(round((rating / 5.0) * 255))
-            popm = POPM(email="musicbrainz@mb-rating", rating=scaled, count=0)
-            popms = [f for f in id3.getall("POPM") if getattr(f, "email", "") != "musicbrainz@mb-rating"]
-            popms.append(popm)
-            id3.setall("POPM", popms)
+            scaled = int(round((rating/5.0)*255))
+            popms = [f for f in id3.getall('POPM') if getattr(f,'email','')!='musicbrainz@mb-rating']
+            popms.append(POPM(email='musicbrainz@mb-rating', rating=scaled, count=0))
+            id3.setall('POPM', popms)
+        id3.save(v2_version=3); return
 
-        id3.save(v2_version=3)
-        return
-
-    # ----- MP4 -----
-    if ext in {".m4a", ".mp4"} and isinstance(audio, MP4):
-        ff_rating = "----:com.apple.iTunes:RATING"
-        ff_mbr = "----:com.apple.iTunes:MUSICBRAINZ_RATING"
-        ff_votes = "----:com.apple.iTunes:MUSICBRAINZ_RATING_VOTES"
-
-        audio.tags[ff_rating] = [MP4FreeForm(rating_str.encode("utf-8"))]
-        audio.tags[ff_mbr] = [MP4FreeForm(rating_str.encode("utf-8"))]
+    if ext in {'.m4a','.mp4'} and isinstance(audio, MP4):
+        ff_rating = '----:com.apple.iTunes:RATING'
+        ff_mbr = '----:com.apple.iTunes:MUSICBRAINZ_RATING'
+        ff_votes = '----:com.apple.iTunes:MUSICBRAINZ_RATING_VOTES'
+        audio.tags[ff_rating] = [MP4FreeForm(rating_str.encode('utf-8'))]
+        audio.tags[ff_mbr] = [MP4FreeForm(rating_str.encode('utf-8'))]
         if votes_str:
-            audio.tags[ff_votes] = [MP4FreeForm(votes_str.encode("utf-8"))]
+            audio.tags[ff_votes] = [MP4FreeForm(votes_str.encode('utf-8'))]
+        audio.save(); return
 
-        audio.save()
-        return
+# --------------- Write rating (release-group fallback) ---------------
+def write_rg_rating_tags(audio, path: str, rating: float, votes: int):
+    ext = os.path.splitext(path)[1].lower()
+    rating_str = f"{rating:.1f}"
+    votes_str = str(votes) if votes is not None else None
 
+    if isinstance(audio,(FLAC,OggVorbis,OggOpus)):
+        audio['RATING_RG'] = rating_str
+        audio['MUSICBRAINZ_RG_RATING'] = rating_str
+        if votes_str: audio['MUSICBRAINZ_RG_RATING_VOTES'] = votes_str
+        audio.save(); return
 
-# ---------------------------------------------------------------------
-#                       ITÉRATION DES FICHIERS AUDIO
-# ---------------------------------------------------------------------
+    if ext == '.mp3':
+        try: id3 = ID3(path)
+        except ID3NoHeaderError: id3 = ID3()
+        id3.add(TXXX(encoding=3, desc='RATING_RG', text=rating_str))
+        id3.add(TXXX(encoding=3, desc='MUSICBRAINZ_RG_RATING', text=rating_str))
+        if votes_str:
+            id3.add(TXXX(encoding=3, desc='MUSICBRAINZ_RG_RATING_VOTES', text=votes_str))
+        id3.save(v2_version=3); return
+
+    if ext in {'.m4a','.mp4'} and isinstance(audio, MP4):
+        ff_rating = '----:com.apple.iTunes:RATING_RG'
+        ff_mbr = '----:com.apple.iTunes:MUSICBRAINZ_RG_RATING'
+        ff_votes = '----:com.apple.iTunes:MUSICBRAINZ_RG_RATING_VOTES'
+        audio.tags[ff_rating] = [MP4FreeForm(rating_str.encode('utf-8'))]
+        audio.tags[ff_mbr] = [MP4FreeForm(rating_str.encode('utf-8'))]
+        if votes_str:
+            audio.tags[ff_votes] = [MP4FreeForm(votes_str.encode('utf-8'))]
+        audio.save(); return
+
+# --------------- File iteration ---------------
 def iter_audio_files(root: str):
     if os.path.isfile(root):
         yield root
