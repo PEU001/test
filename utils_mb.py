@@ -66,8 +66,7 @@ def _safe_get(url: str, headers: dict, params: dict, timeout: int = 15, retries:
 # ---------------- Log ----------------
 def write_log(status: str, file_rel: str, details: str, log_file: str = LOG_FILE):
     ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-    line = f"{ts} | {status.upper()} | {file_rel} | {details}
-"
+    line = f"{ts} | {status.upper()} | {file_rel} | {details}"
     with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
         f.write(line)
 
