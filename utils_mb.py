@@ -1,9 +1,11 @@
 
-# utils_mb.py
+# utils_mb.py — ultra-safe MusicBrainz helpers (Python 3.8+)
 import os
 import re
 import time
+import threading
 import requests
+from requests.exceptions import ConnectionError, ReadTimeout, ChunkedEncodingError
 from mutagen import File
 from mutagen.id3 import ID3, ID3NoHeaderError, TXXX, POPM
 from mutagen.flac import FLAC
@@ -15,13 +17,60 @@ API_ROOT = "https://musicbrainz.org/ws/2"
 LOG_FILE = "mb_rating_tag.log"
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".mp4", ".alac"}
 
+# ---- Ultra-strict throttle ----
+_MIN_INTERVAL = 1.5  # seconds between ANY two MB calls
+_last_call_ts = 0.0
+_lock = threading.Lock()
+_session = requests.Session()
+
+# In-run caches (avoid repeated hits within same run)
+_mem_rating_rec = {}        # rec_mbid -> (value, votes) or None
+_mem_releases_by_rec = {}   # rec_mbid -> first release MBID or None
+_mem_rgid_by_release = {}   # release_mbid -> rgid or None
+_mem_rating_rg = {}         # rgid -> (value, votes) or None
+
+
+def _rate_limit():
+    global _last_call_ts
+    with _lock:
+        now = time.time()
+        delta = now - _last_call_ts
+        if delta < _MIN_INTERVAL:
+            time.sleep(_MIN_INTERVAL - delta)
+        _last_call_ts = time.time()
+
+
+def _safe_get(url: str, headers: dict, params: dict, timeout: int = 15, retries: int = 3):
+    """GET with throttle + manual retries & backoff. Returns requests.Response.
+    Retries on ConnectionError/ReadTimeout/ChunkedEncodingError and HTTP 429/503.
+    """
+    backoff = 2.0
+    for attempt in range(1, retries + 1):
+        _rate_limit()
+        try:
+            resp = _session.get(url, headers=headers, params=params, timeout=timeout)
+            if resp.status_code in (429, 503):
+                if attempt < retries:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+            return resp
+        except (ConnectionError, ReadTimeout, ChunkedEncodingError):
+            if attempt >= retries:
+                raise
+            time.sleep(backoff)
+            backoff *= 2
+    raise RuntimeError("_safe_get: exhausted retries")
+
+
 # ---------------- Log ----------------
 def write_log(status: str, file_rel: str, details: str, log_file: str = LOG_FILE):
     ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
     line = f"{ts} | {status.upper()} | {file_rel} | {details}
 "
-    with open(log_file, 'a', encoding='utf-8') as f:
+    with open(log_file, 'a', encoding='utf-8', errors='replace') as f:
         f.write(line)
+
 
 # --------------- Helpers ---------------
 def read_string(v):
@@ -36,10 +85,10 @@ def read_string(v):
             return None
     return str(v)
 
+
 # --------------- MBID / Identity ---------------
 def extract_mb_recording_id(audio, path: str):
     ext = os.path.splitext(path)[1].lower()
-    # FLAC / Vorbis / Opus
     if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
         if audio.tags:
             for key in ("MUSICBRAINZ_TRACKID","MUSICBRAINZ_RECORDINGID","MB_TRACKID"):
@@ -48,7 +97,6 @@ def extract_mb_recording_id(audio, path: str):
                     s = read_string(val)
                     if s and re.match(r"^[0-9a-f-]{36}$", s, re.I):
                         return s
-    # MP3 ID3
     if ext == ".mp3":
         try:
             id3 = ID3(path)
@@ -60,7 +108,6 @@ def extract_mb_recording_id(audio, path: str):
                         return text
         except ID3NoHeaderError:
             pass
-    # MP4
     if ext in {".m4a",".mp4"} and isinstance(audio, MP4):
         for k in (audio.tags or {}).keys():
             if k.lower().startswith("----:") and "musicbrainz" in k.lower() and "track" in k.lower():
@@ -94,25 +141,36 @@ def extract_basic_identity(audio, path: str):
         title = read_string(tags.get('©nam'))
     return artist, title, duration_ms
 
-# --------------- MusicBrainz API helpers ---------------
+
+# --------------- MusicBrainz API helpers (ultra-safe) ---------------
+def _headers(ua: str):
+    return {"User-Agent": ua or "mbtools/1.0 (no-contact)"}
+
+
 def mb_get_recording_rating(mbid: str, ua: str):
+    if mbid in _mem_rating_rec:
+        return _mem_rating_rec[mbid]
     url = f"{API_ROOT}/recording/{mbid}"
-    headers = {"User-Agent": ua}
     params = {"inc":"ratings","fmt":"json"}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r = _safe_get(url, _headers(ua), params)
     if r.status_code == 404:
+        _mem_rating_rec[mbid] = None
         return None
     r.raise_for_status()
     data = r.json()
     rating = data.get('rating', {})
-    return rating.get('value'), rating.get('votes-count')
+    val = rating.get('value')
+    votes = rating.get('votes-count')
+    out = (val, votes)
+    _mem_rating_rec[mbid] = out
+    return out
 
 
 def mb_search_recording(artist: str, title: str, duration_ms: int, ua: str):
     query = f'recording:"{title}" AND artist:"{artist}"'
-    headers = {"User-Agent": ua}
+    url = f"{API_ROOT}/recording"
     params = {"query": query, "fmt":"json", "limit": 5}
-    r = requests.get(f"{API_ROOT}/recording", headers=headers, params=params, timeout=25)
+    r = _safe_get(url, _headers(ua), params)
     if r.status_code == 404:
         return None
     r.raise_for_status()
@@ -120,7 +178,6 @@ def mb_search_recording(artist: str, title: str, duration_ms: int, ua: str):
     recs = data.get('recordings') or []
     if not recs:
         return None
-    # choose best by score, then by closest duration
     recs.sort(key=lambda x: x.get('score',0), reverse=True)
     best = recs[0]
     if duration_ms:
@@ -134,42 +191,57 @@ def mb_search_recording(artist: str, title: str, duration_ms: int, ua: str):
 
 
 def mb_get_first_release_id_for_recording(rec_mbid: str, ua: str):
+    if rec_mbid in _mem_releases_by_rec:
+        return _mem_releases_by_rec[rec_mbid]
     url = f"{API_ROOT}/recording/{rec_mbid}"
-    headers = {"User-Agent": ua}
     params = {"inc":"releases","fmt":"json"}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r = _safe_get(url, _headers(ua), params)
     if r.status_code == 404:
+        _mem_releases_by_rec[rec_mbid] = None
         return None
     r.raise_for_status()
     data = r.json()
     rels = data.get('releases') or []
-    return rels[0]['id'] if rels else None
+    rid = rels[0]['id'] if rels else None
+    _mem_releases_by_rec[rec_mbid] = rid
+    return rid
 
 
 def mb_get_release_group_id(release_mbid: str, ua: str):
+    if release_mbid in _mem_rgid_by_release:
+        return _mem_rgid_by_release[release_mbid]
     url = f"{API_ROOT}/release/{release_mbid}"
-    headers = {"User-Agent": ua}
     params = {"inc":"release-groups","fmt":"json"}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r = _safe_get(url, _headers(ua), params)
     if r.status_code == 404:
+        _mem_rgid_by_release[release_mbid] = None
         return None
     r.raise_for_status()
     data = r.json()
     rg = data.get('release-group') or {}
-    return rg.get('id')
+    rgid = rg.get('id')
+    _mem_rgid_by_release[release_mbid] = rgid
+    return rgid
 
 
 def mb_get_release_group_rating(rgid: str, ua: str):
+    if rgid in _mem_rating_rg:
+        return _mem_rating_rg[rgid]
     url = f"{API_ROOT}/release-group/{rgid}"
-    headers = {"User-Agent": ua}
     params = {"inc":"ratings","fmt":"json"}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r = _safe_get(url, _headers(ua), params)
     if r.status_code == 404:
+        _mem_rating_rg[rgid] = None
         return None
     r.raise_for_status()
     data = r.json()
     rating = data.get('rating', {})
-    return rating.get('value'), rating.get('votes-count')
+    val = rating.get('value')
+    votes = rating.get('votes-count')
+    out = (val, votes)
+    _mem_rating_rg[rgid] = out
+    return out
+
 
 # --------------- Write rating (recording) ---------------
 def write_rating_generic(audio, path: str, rating: float, votes: int, write_popm: bool):
@@ -213,6 +285,7 @@ def write_rating_generic(audio, path: str, rating: float, votes: int, write_popm
             audio.tags[ff_votes] = [MP4FreeForm(votes_str.encode('utf-8'))]
         audio.save(); return
 
+
 # --------------- Write rating (release-group fallback) ---------------
 def write_rg_rating_tags(audio, path: str, rating: float, votes: int):
     ext = os.path.splitext(path)[1].lower()
@@ -243,6 +316,7 @@ def write_rg_rating_tags(audio, path: str, rating: float, votes: int):
         if votes_str:
             audio.tags[ff_votes] = [MP4FreeForm(votes_str.encode('utf-8'))]
         audio.save(); return
+
 
 # --------------- File iteration ---------------
 def iter_audio_files(root: str):

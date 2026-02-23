@@ -4,8 +4,7 @@ import base64
 from datetime import datetime
 
 def fmt_ms(ms):
-    if not ms:
-        return ''
+    if not ms: return ''
     s=int(round(ms/1000)); m,s=divmod(s,60); h,m=divmod(m,60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
@@ -13,8 +12,7 @@ def _esc(s):
     import html
     return html.escape('' if s is None else str(s))
 
-_CSS = """
-:root { color-scheme: light dark; }
+_CSS = ":root { color-scheme: light dark; }
 body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:24px; }
 header { margin-bottom: 16px; }
 h1 { font-size: 22px; margin:0 0 8px 0; }
@@ -26,7 +24,7 @@ th,td { border-bottom:1px solid #eee; padding:6px; text-align:left; }
 th { position:sticky; top:0; background:canvas; }
 tr:hover { background: rgba(0,0,0,.03); }
 .note { color:#666; font-size:12px; }
-"""
+"
 
 def generate_html_report(results, started: datetime, ended: datetime, output_path: str):
     total=len(results)
@@ -73,7 +71,8 @@ def generate_html_report(results, started: datetime, ended: datetime, output_pat
             "<td>{status}</td><td>{file}</td><td>{artist}</td><td>{title}</td>"
             "<td>{rating}</td><td>{votes}</td><td>{duration}</td>"
             "<td>{mbid}</td><td>{mbid_rg}</td><td>{fallback}</td>"
-            "<td>{exotic}</td><td>{removed}</td><td>{cover}</td><td class='note'>{message}</td>"             "</tr>".format(
+            "<td>{exotic}</td><td>{removed}</td><td>{cover}</td><td class='note'>{message}</td>"
+            "</tr>".format(
                 status=_esc(r.get('status')),
                 file=_esc(r.get('file')),
                 artist=_esc(r.get('artist')),
@@ -112,8 +111,7 @@ def generate_html_report(results, started: datetime, ended: datetime, output_pat
     html_table = (
         "<table id='tbl'><thead><tr>"
         "<th>Statut</th><th>Fichier</th><th>Artiste</th><th>Titre</th><th>Note</th><th>Votes</th><th>Durée</th>"
-        "<th>MBID</th><th>MBID RG</th><th>Fallback RG</th>"
-        "<th>Tags exotiques</th><th>Supprimés</th><th>Pochette</th><th>Message</th>"
+        "<th>MBID</th><th>MBID RG</th><th>Fallback RG</th><th>Tags exotiques</th><th>Supprimés</th><th>Pochette</th><th>Message</th>"
         "</tr></thead><tbody>" + rows_html + "</tbody></table>"
     )
     _JS = """
@@ -129,7 +127,6 @@ def generate_html_report(results, started: datetime, ended: datetime, output_pat
 })();
 """
     html_js = "<script>" + _JS + "</script>"
-
     html = html_head + html_header + html_toolbar + html_table + html_js + "</body></html>"
     with open(output_path,'w',encoding='utf-8') as f:
         f.write(html)

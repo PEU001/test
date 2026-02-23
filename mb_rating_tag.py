@@ -2,9 +2,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mb_rating_tag.py — Script principal (COMPLET avec fallback release-group)
+mb_rating_tag.py — Script principal (ULTRA-SAFE + fallback release-group)
 """
-import os, argparse, time
+import os, argparse
 from datetime import datetime
 from mutagen import File
 
@@ -18,8 +18,6 @@ from cache import MbCache
 from exotic_cleanup import analyze_tags_and_cover, remove_exotic_tags
 from backup_restore import backup_tags, restore_tags
 from report_html import generate_html_report
-
-RATE_LIMIT_SECONDS = 1.1
 
 
 def process_file(path: str, root: str, ua: str,
@@ -90,12 +88,10 @@ def process_file(path: str, root: str, ua: str,
         if mbid:
             if not value_votes:
                 value_votes = mb_get_recording_rating(mbid, ua)
-                time.sleep(RATE_LIMIT_SECONDS)
                 if cache and value_votes is not None:
                     cache.set_rating(mbid, value_votes[0], value_votes[1])
         else:
             mbid = mb_search_recording(artist or '', title or '', duration_ms, ua)
-            time.sleep(RATE_LIMIT_SECONDS)
             if cache and mbid:
                 cache.set_search_mbid(artist, title, duration_ms, mbid)
             if not mbid:
@@ -104,7 +100,6 @@ def process_file(path: str, root: str, ua: str,
             value_votes = cache.get_rating(mbid) if cache else None
             if not value_votes:
                 value_votes = mb_get_recording_rating(mbid, ua)
-                time.sleep(RATE_LIMIT_SECONDS)
                 if cache and value_votes is not None:
                     cache.set_rating(mbid, value_votes[0], value_votes[1])
 
@@ -121,13 +116,10 @@ def process_file(path: str, root: str, ua: str,
 
         # ---------- FALLBACK : release-group ----------
         release_id = mb_get_first_release_id_for_recording(mbid, ua)
-        time.sleep(RATE_LIMIT_SECONDS)
         if release_id:
             rgid = mb_get_release_group_id(release_id, ua)
-            time.sleep(RATE_LIMIT_SECONDS)
             if rgid:
                 rg_rating = mb_get_release_group_rating(rgid, ua)
-                time.sleep(RATE_LIMIT_SECONDS)
                 if rg_rating and rg_rating[0] is not None:
                     rg_value, rg_votes = rg_rating
                     result['mbid_rg'] = rgid
@@ -153,7 +145,7 @@ def process_file(path: str, root: str, ua: str,
 
 
 def main():
-    p=argparse.ArgumentParser(description='MusicBrainz rating + log + report + cleanup + backup/restore + cache + RG fallback')
+    p=argparse.ArgumentParser(description='ULTRA-SAFE MusicBrainz rating + log + report + cleanup + backup/restore + cache + RG fallback')
     p.add_argument('path')
     p.add_argument('--ua', required=True)
     p.add_argument('--write-popm', action='store_true')
