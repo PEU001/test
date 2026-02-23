@@ -1,184 +1,272 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mb_rating_tag.py — Script principal (COMPLET)
 
-# utils_mb.py
-import re, time
-import requests
-from mutagen import File
-from mutagen.id3 import ID3, ID3NoHeaderError, TXXX, POPM
-from mutagen.flac import FLAC
-from mutagen.oggvorbis import OggVorbis
-from mutagen.oggopus import OggOpus
-from mutagen.mp4 import MP4, MP4FreeForm
+Fonctionnalités :
+- Récupère la note MusicBrainz (0–5) et l’écrit dans les tags (Vorbis/ID3/MP4).
+- Option POPM (MP3).
+- Recherche MBID (artist + title + dur) si manquant.
+- Nettoyage des tags exotiques (conservative/strict + listes d’exceptions).
+- Détection de pochette.
+- Backup et restauration des tags.
+- Cache local SQLite (ratings + résolutions de recherche).
+- Rapport HTML + log texte.
 
-API_ROOT = "https://musicbrainz.org/ws/2"
-LOG_FILE = "mb_rating_tag.log"
-AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".mp4", ".alac"}
+Python 3.8+ (testé 3.12.8)
+Dépendances : mutagen, requests
+"""
 
-# ---------------- Log ----------------
-def write_log(status: str, file_rel: str, details: str, log_file: str = LOG_FILE):
-    ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-    line = f"{ts} | {status.upper()} | {file_rel} | {details}
-"
-    with open(log_file, 'a', encoding='utf-8') as f:
-        f.write(line)
-
-# --------------- Helpers ---------------
-def read_string(v):
-    if v is None: return None
-    if isinstance(v, list):
-        return read_string(v[0]) if v else None
-    if isinstance(v, bytes):
-        try: return v.decode('utf-8', 'replace')
-        except: return None
-    return str(v)
-
-# --------------- MBID / Identity ---------------
-def extract_mb_recording_id(audio, path: str):
-    ext = os.path.splitext(path)[1].lower()
-    # FLAC / Vorbis / Opus
-    if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
-        if audio.tags:
-            for key in ("MUSICBRAINZ_TRACKID","MUSICBRAINZ_RECORDINGID","MB_TRACKID"):
-                val = audio.tags.get(key)
-                if val:
-                    s = read_string(val)
-                    if s and re.match(r"^[0-9a-f-]{36}$", s, re.I):
-                        return s
-    # MP3 ID3
-    if ext == ".mp3":
-        try:
-            id3 = ID3(path)
-            for frame in id3.getall("TXXX"):
-                desc = (frame.desc or '').strip().lower()
-                if desc in {"musicbrainz track id","musicbrainz_trackid","musicbrainz recording id"}:
-                    text = read_string(frame.text)
-                    if text and re.match(r"^[0-9a-f-]{36}$", text, re.I):
-                        return text
-        except ID3NoHeaderError:
-            pass
-    # MP4
-    if ext in {".m4a",".mp4"} and isinstance(audio, MP4):
-        for k in (audio.tags or {}).keys():
-            if k.lower().startswith("----:") and "musicbrainz" in k.lower() and "track" in k.lower():
-                val = audio.tags.get(k)
-                s = read_string(val)
-                if s and re.match(r"^[0-9a-f-]{36}$", s, re.I):
-                    return s
-    return None
-
-
-def extract_basic_identity(audio, path: str):
-    ext = os.path.splitext(path)[1].lower()
-    artist = title = None
-    duration_ms = None
-    if hasattr(audio, 'info') and getattr(audio.info, 'length', None):
-        duration_ms = int(audio.info.length * 1000)
-    if isinstance(audio, (FLAC, OggVorbis, OggOpus)):
-        tags = audio.tags or {}
-        artist = read_string(tags.get('ARTIST')) or read_string(tags.get('ALBUMARTIST'))
-        title = read_string(tags.get('TITLE'))
-    elif ext == '.mp3':
-        try:
-            id3 = ID3(path)
-            artist = read_string(getattr(id3.get('TPE1'),'text',None))
-            title = read_string(getattr(id3.get('TIT2'),'text',None))
-        except ID3NoHeaderError:
-            pass
-    elif ext in {'.m4a','.mp4'} and isinstance(audio, MP4):
-        tags = audio.tags or {}
-        artist = read_string(tags.get('©ART'))
-        title = read_string(tags.get('©nam'))
-    return artist, title, duration_ms
-
-# --------------- MusicBrainz API ---------------
-def mb_get_recording_rating(mbid: str, ua: str):
-    url = f"{API_ROOT}/recording/{mbid}"
-    headers = {"User-Agent": ua}
-    params = {"inc":"ratings","fmt":"json"}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    data = r.json()
-    rating = data.get('rating', {})
-    return rating.get('value'), rating.get('votes-count')
-
-
-def mb_search_recording(artist: str, title: str, duration_ms: int, ua: str):
-    query = f'recording:"{title}" AND artist:"{artist}"'
-    headers = {"User-Agent": ua}
-    params = {"query": query, "fmt":"json", "limit": 5}
-    r = requests.get(f"{API_ROOT}/recording", headers=headers, params=params, timeout=25)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    data = r.json()
-    recs = data.get('recordings') or []
-    if not recs:
-        return None
-    # choose best by score, then by closest duration
-    recs.sort(key=lambda x: x.get('score',0), reverse=True)
-    best = recs[0]
-    if duration_ms:
-        def penalty(rec):
-            length = rec.get('length') or 10**9
-            return abs(length - duration_ms)
-        recs.sort(key=penalty)
-        if abs((recs[0].get('length') or 10**9) - duration_ms) <= 2000:
-            best = recs[0]
-    return best.get('id')
-
-# --------------- Write rating ---------------
-def write_rating_generic(audio, path: str, rating: float, votes: int, write_popm: bool):
-    from mutagen.id3 import ID3, ID3NoHeaderError
-    from mutagen.mp4 import MP4, MP4FreeForm
-    ext = os.path.splitext(path)[1].lower()
-    rating_str = f"{rating:.1f}"
-    votes_str = str(votes) if votes is not None else None
-
-    if isinstance(audio,(FLAC,OggVorbis,OggOpus)):
-        audio['RATING'] = rating_str
-        audio['MUSICBRAINZ_RATING'] = rating_str
-        if votes_str: audio['MUSICBRAINZ_RATING_VOTES'] = votes_str
-        audio.save(); return
-
-    if ext == '.mp3':
-        try: id3 = ID3(path)
-        except ID3NoHeaderError: id3 = ID3()
-        keep=[]
-        for f in id3.getall('TXXX'):
-            d=(f.desc or '').lower()
-            if d not in {'rating','musicbrainz_rating','musicbrainz_rating_votes'}:
-                keep.append(f)
-        id3.setall('TXXX', keep)
-        id3.add(TXXX(encoding=3, desc='RATING', text=rating_str))
-        id3.add(TXXX(encoding=3, desc='MUSICBRAINZ_RATING', text=rating_str))
-        if votes_str:
-            id3.add(TXXX(encoding=3, desc='MUSICBRAINZ_RATING_VOTES', text=votes_str))
-        if write_popm:
-            scaled = int(round((rating/5.0)*255))
-            popms = [f for f in id3.getall('POPM') if getattr(f,'email','')!='musicbrainz@mb-rating']
-            popms.append(POPM(email='musicbrainz@mb-rating', rating=scaled, count=0))
-            id3.setall('POPM', popms)
-        id3.save(v2_version=3); return
-
-    if ext in {'.m4a','.mp4'} and isinstance(audio, MP4):
-        ff_rating = '----:com.apple.iTunes:RATING'
-        ff_mbr = '----:com.apple.iTunes:MUSICBRAINZ_RATING'
-        ff_votes = '----:com.apple.iTunes:MUSICBRAINZ_RATING_VOTES'
-        audio.tags[ff_rating] = [MP4FreeForm(rating_str.encode('utf-8'))]
-        audio.tags[ff_mbr] = [MP4FreeForm(rating_str.encode('utf-8'))]
-        if votes_str:
-            audio.tags[ff_votes] = [MP4FreeForm(votes_str.encode('utf-8'))]
-        audio.save(); return
-
-# --------------- File iteration ---------------
 import os
+import sys
+import time
+import argparse
+from datetime import datetime
+from mutagen import File
 
-def iter_audio_files(root: str):
-    if os.path.isfile(root):
-        yield root
-    else:
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
-                if os.path.splitext(fname)[1].lower() in AUDIO_EXTS:
-                    yield os.path.join(dirpath, fname)
+from utils_mb import (
+    write_log, iter_audio_files, extract_mb_recording_id, extract_basic_identity,
+    mb_get_recording_rating, mb_search_recording, write_rating_generic
+)
+from cache import MbCache
+from exotic_cleanup import analyze_tags_and_cover, remove_exotic_tags
+from backup_restore import backup_tags, restore_tags
+from report_html import generate_html_report
+
+
+RATE_LIMIT_SECONDS = 1.1  # règle MusicBrainz : max 1 req/s
+
+
+def process_file(
+    path: str,
+    root: str,
+    ua: str,
+    write_popm: bool,
+    search_fallback: bool,
+    dry_run: bool,
+    remove_exotic: bool,
+    exotic_mode: str,
+    allow_txxx: set,
+    allow_vorbis: set,
+    allow_mp4: set,
+    do_backup: bool,
+    do_restore: bool,
+    backup_dir: str,
+    cache: "MbCache | None" = None,
+) -> dict:
+    """Traite un fichier et retourne un dict de résultat (pour le rapport)."""
+
+    rel = os.path.relpath(path, root) if os.path.isdir(root) else os.path.basename(path)
+    result = {
+        "file": rel,
+        "status": "skip",
+        "mbid": None,
+        "rating": None,
+        "votes": None,
+        "artist": None,
+        "title": None,
+        "duration_ms": None,
+        "has_cover": None,
+        "exotic_tags": [],
+        "removed_exotic": [],
+        "message": "",
+    }
+
+    try:
+        audio = File(path, easy=False)
+        if audio is None:
+            msg = "Non audio ou format non supporté"
+            write_log("skip", rel, msg)
+            result.update({"status": "skip", "message": msg})
+            return result
+
+        # ---- Restauration (prioritaire) ----
+        if do_restore:
+            ok, msg = restore_tags(path, rel, backup_dir)
+            write_log("restore", rel, msg)
+            result.update({"status": "restore", "message": msg})
+            # Réanalyse (exotiques + pochette) après restauration
+            audio2 = File(path, easy=False)
+            ex2, cov2 = analyze_tags_and_cover(audio2, path)
+            result.update({"exotic_tags": ex2, "has_cover": cov2})
+            return result
+
+        # ---- Analyse préliminaire (exotiques + pochette) ----
+        exotic, has_cover = analyze_tags_and_cover(audio, path)
+        result["exotic_tags"] = exotic
+        result["has_cover"] = has_cover
+
+        # ---- Backup avant modifs ----
+        if do_backup:
+            bpath = backup_tags(audio, path, rel, backup_dir)
+            write_log("backup", rel, f"Backup: {bpath}")
+            result["backup"] = bpath
+
+        # ---- Nettoyage éventuel des tags exotiques ----
+        if remove_exotic and exotic:
+            if dry_run:
+                write_log("plan-clean", rel, f"Suppression prévue ({exotic_mode}) : {', '.join(exotic)}")
+                result["removed_exotic"] = exotic[:]  # planifié
+            else:
+                removed = remove_exotic_tags(audio, path, exotic_mode, allow_txxx, allow_vorbis, allow_mp4)
+                if removed:
+                    write_log("clean", rel, f"Supprimés ({exotic_mode}) : {', '.join(removed)}")
+                result["removed_exotic"] = removed
+                # Recharger le fichier (tags à jour)
+                audio = File(path, easy=False)
+
+        # ---- Identification MBID / identité basique ----
+        mbid = extract_mb_recording_id(audio, path)
+        artist, title, duration_ms = extract_basic_identity(audio, path)
+        result.update({"artist": artist, "title": title, "duration_ms": duration_ms})
+
+        # ---- Cache : tentative de hit ----
+        value_votes = None
+        if mbid and cache:
+            value_votes = cache.get_rating(mbid)
+        if not mbid and cache:
+            cached_mbid = cache.get_search_mbid(artist, title, duration_ms)
+            if cached_mbid:
+                mbid = cached_mbid
+
+        # ---- Recherche si pas de MBID ----
+        if not mbid and not (search_fallback and artist and title):
+            msg = "Aucun MBID et infos insuffisantes pour recherche"
+            write_log("skip", rel, msg)
+            result.update({"status": "skip", "message": msg})
+            return result
+
+        if mbid:
+            if not value_votes:
+                value_votes = mb_get_recording_rating(mbid, ua)
+                time.sleep(RATE_LIMIT_SECONDS)
+                if cache and value_votes is not None:
+                    cache.set_rating(mbid, value_votes[0], value_votes[1])
+        else:
+            mbid = mb_search_recording(artist or "", title or "", duration_ms, ua)
+            time.sleep(RATE_LIMIT_SECONDS)
+            if cache and mbid:
+                cache.set_search_mbid(artist, title, duration_ms, mbid)
+            if not mbid:
+                msg = f"Recherche sans résultat pour {artist} - {title}"
+                write_log("not-found", rel, msg)
+                result.update({"status": "not-found", "message": msg})
+                return result
+            value_votes = cache.get_rating(mbid) if cache else None
+            if not value_votes:
+                value_votes = mb_get_recording_rating(mbid, ua)
+                time.sleep(RATE_LIMIT_SECONDS)
+                if cache and value_votes is not None:
+                    cache.set_rating(mbid, value_votes[0], value_votes[1])
+
+        result["mbid"] = mbid
+        if not value_votes or value_votes[0] is None:
+            msg = f"Aucune note pour MBID {mbid}"
+            write_log("not-found", rel, msg)
+            result.update({"status": "not-found", "message": msg})
+            return result
+
+        rating, votes = value_votes
+        result["rating"] = float(rating)
+        result["votes"] = votes
+
+        if dry_run:
+            msg = f"(dry-run) MBID={mbid} rating={rating} votes={votes}"
+            write_log("ok(dry)", rel, msg)
+            result.update({"status": "ok(dry)", "message": msg})
+            return result
+
+        # ---- Écriture des tags ----
+        write_rating_generic(audio, path, float(rating), votes, write_popm)
+        msg = f"MBID={mbid} rating={rating} votes={votes}"
+        write_log("ok", rel, msg)
+        result.update({"status": "ok", "message": msg})
+        return result
+
+    except Exception as e:
+        write_log("error", rel, f"{type(e).__name__}: {e}")
+        result.update({"status": "error", "message": f"{type(e).__name__}: {e}"})
+        return result
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="MusicBrainz rating + log + report + cleanup + backup/restore + cache"
+    )
+    p.add_argument("path", help="Fichier ou dossier")
+    p.add_argument("--ua", required=True, help="User-Agent requis par MusicBrainz (ex: 'MonApp/1.0 (email)')")
+    p.add_argument("--write-popm", action="store_true", help="(MP3) Ecrire aussi POPM (0..255).")
+    p.add_argument("--search-fallback", action="store_true", help="Si pas de MBID, recherche par artist+title+durée.")
+    p.add_argument("--dry-run", action="store_true", help="Simulation : n'écrit pas, ne supprime pas.")
+    # Nettoyage exotiques
+    p.add_argument("--remove-exotic", action="store_true", help="Supprime les tags exotiques.")
+    p.add_argument("--exotic-mode", choices=["conservative", "strict"], default="conservative")
+    p.add_argument("--exotic-allow-txxx", default="", help="Descriptions TXXX à conserver (séparées par ';').")
+    p.add_argument("--exotic-allow-vorbis", default="", help="Clés Vorbis à conserver (séparées par ';').")
+    p.add_argument("--exotic-allow-mp4", default="", help="Atoms MP4 à conserver (séparées par ';').")
+    # Rapport
+    p.add_argument("--report", default="", help="Chemin du rapport HTML (défaut auto).")
+    # Backup / Restore
+    p.add_argument("--backup-tags", action="store_true", help="Sauvegarde des tags avant modifs.")
+    p.add_argument("--restore-tags", action="store_true", help="Restaure les tags depuis backups (aucune autre action).")
+    p.add_argument("--backup-dir", default="backups", help="Répertoire de backups (défaut: backups/).")
+    # Cache local
+    p.add_argument("--cache", action="store_true", help="Active le cache local SQLite.")
+    p.add_argument("--cache-db", default=".mbcache.sqlite", help="Fichier cache (défaut: .mbcache.sqlite).")
+    p.add_argument("--cache-ttl", type=int, default=86400, help="Durée de validité du cache en secondes (défaut: 86400).")
+    p.add_argument("--cache-mode", choices=["ro", "rw", "refresh"], default="rw",
+                   help="ro=read-only, rw=lecture/écriture, refresh=ignore TTL et réécrit.")
+
+    args = p.parse_args()
+
+    # Restore = prioritaire, on désactive autres modifs
+    if args.restore_tags:
+        args.remove_exotic = False
+        args.write_popm = False
+        args.dry_run = False
+
+    allow_txxx = set([s for s in args.exotic_allow_txxx.split(";") if s.strip()])
+    allow_vorbis = set([s for s in args.exotic_allow_vorbis.split(";") if s.strip()])
+    allow_mp4 = set([s for s in args.exotic_allow_mp4.split(";") if s.strip()])
+
+    cache = None
+    if args.cache:
+        cache = MbCache(args.cache_db, mode=args.cache_mode, ttl=args.cache_ttl)
+
+    started = datetime.now()
+    results = []
+    target = args.path
+    try:
+        for fpath in iter_audio_files(target):
+            res = process_file(
+                path=fpath,
+                root=target,
+                ua=args.ua,
+                write_popm=args.write_popm,
+                search_fallback=args.search_fallback,
+                dry_run=args.dry_run,
+                remove_exotic=args.remove_exotic,
+                exotic_mode=args.exotic_mode,
+                allow_txxx=allow_txxx,
+                allow_vorbis=allow_vorbis,
+                allow_mp4=allow_mp4,
+                do_backup=args.backup_tags,
+                do_restore=args.restore_tags,
+                backup_dir=args.backup_dir,
+                cache=cache,
+            )
+            results.append(res)
+    finally:
+        if cache:
+            cache.close()
+
+    ended = datetime.now()
+    report_path = args.report or f"mb_rating_report_{ended.strftime('%Y%m%d_%H%M%S')}.html"
+    generate_html_report(results, started, ended, report_path)
+    print("Terminé.")
+    print(" - Log: mb_rating_tag.log")
+    print(f" - Report: {report_path}")
+
+
+if __name__ == "__main__":
+    main()
